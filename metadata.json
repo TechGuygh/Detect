@@ -1,0 +1,5 @@
+{
+  "name": "Sentinel Security Dashboard",
+  "description": "A modern, real-time security monitoring dashboard with suspicious activity detection, live log streaming, and threat analytics.",
+  "requestFramePermissions": []
+}
