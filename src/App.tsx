@@ -23,7 +23,12 @@ import {
   Edit2,
   Info,
   ChevronRight,
-  ShieldX
+  ShieldX,
+  History,
+  Key,
+  RefreshCw,
+  Zap,
+  MapPin
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { format } from "date-fns";
@@ -48,6 +53,9 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+import { jsPDF } from "jspdf";
+import "jspdf-autotable";
+
 // Types
 interface LogEntry {
   id: string;
@@ -56,6 +64,22 @@ interface LogEntry {
   timestamp: string;
   status: "success" | "failed";
   location: string;
+}
+
+interface UserAccount {
+  id: string;
+  username: string;
+  role: "admin" | "viewer";
+  createdAt: string;
+  mustChangePassword?: boolean;
+}
+
+interface AuditLog {
+  id: string;
+  adminUsername: string;
+  action: string;
+  targetUsername: string;
+  timestamp: string;
 }
 
 interface Alert {
@@ -136,6 +160,14 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [theme, setTheme] = useState("dark");
   const [socket, setSocket] = useState<Socket | null>(null);
+  const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
+  const [users, setUsers] = useState<UserAccount[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [isUserModalOpen, setIsUserModalOpen] = useState(false);
+  const [editingUser, setEditingUser] = useState<UserAccount | null>(null);
+  const [userForm, setUserForm] = useState({ username: "", password: "", role: "viewer" as "admin" | "viewer" });
+  const [mustChangePassword, setMustChangePassword] = useState(false);
+  const [newPassword, setNewPassword] = useState("");
 
   // Login form state
   const [loginUsername, setLoginUsername] = useState("");
@@ -172,11 +204,37 @@ export default function App() {
     });
 
     fetchInitialData();
+    if (user?.role === "admin") {
+      fetchUsers();
+      fetchAuditLogs();
+    }
 
     return () => {
       newSocket.close();
     };
-  }, []);
+  }, [user]);
+
+  const fetchUsers = async () => {
+    try {
+      const res = await fetch("/api/users", {
+        headers: { Authorization: `Bearer ${user?.token}` }
+      });
+      if (res.ok) setUsers(await res.json());
+    } catch (err) {
+      console.error("Failed to fetch users", err);
+    }
+  };
+
+  const fetchAuditLogs = async () => {
+    try {
+      const res = await fetch("/api/audit-logs", {
+        headers: { Authorization: `Bearer ${user?.token}` }
+      });
+      if (res.ok) setAuditLogs(await res.json());
+    } catch (err) {
+      console.error("Failed to fetch audit logs", err);
+    }
+  };
 
   const fetchInitialData = async () => {
     try {
@@ -185,17 +243,27 @@ export default function App() {
         fetch("/api/alerts"),
         fetch("/api/stats")
       ]);
+      
+      if (!logsRes.ok || !alertsRes.ok || !statsRes.ok) {
+        throw new Error("One or more initial data requests failed");
+      }
+
       setLogs(await logsRes.json());
       setAlerts(await alertsRes.json());
       setStats(await statsRes.json());
     } catch (err) {
-      console.error("Failed to fetch data", err);
+      console.error("Failed to fetch initial data", err);
     }
   };
 
   const updateStats = async () => {
     try {
       const res = await fetch("/api/stats");
+      if (!res.ok) {
+        const text = await res.text();
+        console.error("Stats request failed:", res.status, text.slice(0, 100));
+        return;
+      }
       setStats(await res.json());
     } catch (err) {
       console.error("Failed to update stats", err);
@@ -213,8 +281,13 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        setUser(data);
-        toast.success(`Welcome back, ${data.username}`);
+        if (data.mustChangePassword) {
+          setMustChangePassword(true);
+          setUser(data);
+        } else {
+          setUser(data);
+          toast.success(`Welcome back, ${data.username}`);
+        }
       } else {
         setLoginError("Invalid username or password");
       }
@@ -238,6 +311,141 @@ export default function App() {
     }
   };
 
+  const exportLogsCSV = () => {
+    const headers = ["Timestamp", "Username", "IP Address", "Location", "Status"];
+    const csvData = filteredLogs.map(log => [
+      format(new Date(log.timestamp), "yyyy-MM-dd HH:mm:ss"),
+      log.username,
+      log.ip,
+      log.location,
+      log.status
+    ]);
+    
+    const csvContent = [headers, ...csvData].map(e => e.join(",")).join("\n");
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `security_logs_${format(new Date(), "yyyyMMdd_HHmm")}.csv`);
+    link.style.visibility = "hidden";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    toast.success("Logs exported to CSV");
+  };
+
+  const exportLogsPDF = () => {
+    const doc = new jsPDF();
+    doc.text("Sentinel Security Dashboard - Authentication Logs", 14, 15);
+    
+    const tableData = filteredLogs.map(log => [
+      format(new Date(log.timestamp), "yyyy-MM-dd HH:mm:ss"),
+      log.username,
+      log.ip,
+      log.location,
+      log.status
+    ]);
+
+    (doc as any).autoTable({
+      head: [["Timestamp", "Username", "IP Address", "Location", "Status"]],
+      body: tableData,
+      startY: 20,
+    });
+
+    doc.save(`security_logs_${format(new Date(), "yyyyMMdd_HHmm")}.pdf`);
+    toast.success("Logs exported to PDF");
+  };
+
+  const handleSaveUser = async () => {
+    const method = editingUser ? "PUT" : "POST";
+    const url = editingUser ? `/api/users/${editingUser.id}` : "/api/users";
+    
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: { 
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${user?.token}`
+        },
+        body: JSON.stringify(userForm)
+      });
+      
+      if (res.ok) {
+        toast.success(`User ${editingUser ? "updated" : "created"} successfully`);
+        setIsUserModalOpen(false);
+        fetchUsers();
+        setUserForm({ username: "", password: "", role: "viewer" });
+      } else {
+        const data = await res.json();
+        toast.error(data.error || "Failed to save user");
+      }
+    } catch (err) {
+      toast.error("Connection failed");
+    }
+  };
+
+  const handleDeleteUser = async (id: string) => {
+    if (!confirm("Are you sure you want to delete this user?")) return;
+    try {
+      const res = await fetch(`/api/users/${id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${user?.token}` }
+      });
+      if (res.ok) {
+        toast.success("User deleted");
+        fetchUsers();
+        fetchAuditLogs();
+      } else {
+        const data = await res.json();
+        toast.error(data.error || "Failed to delete user");
+      }
+    } catch (err) {
+      toast.error("Connection failed");
+    }
+  };
+
+  const handleResetPassword = async (id: string) => {
+    if (!confirm("Are you sure you want to reset this user's password?")) return;
+    try {
+      const res = await fetch(`/api/users/${id}/reset-password`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${user?.token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        toast.success(`Password reset successfully. Temporary password: ${data.tempPassword}`, {
+          duration: 10000,
+        });
+        fetchAuditLogs();
+      } else {
+        toast.error("Failed to reset password");
+      }
+    } catch (err) {
+      toast.error("Connection failed");
+    }
+  };
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      const res = await fetch("/api/change-password", {
+        method: "POST",
+        headers: { 
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${user?.token}`
+        },
+        body: JSON.stringify({ newPassword })
+      });
+      if (res.ok) {
+        setMustChangePassword(false);
+        toast.success("Password updated successfully");
+      } else {
+        toast.error("Failed to update password");
+      }
+    } catch (err) {
+      toast.error("Connection failed");
+    }
+  };
   const filteredLogs = useMemo(() => {
     return logs.filter(log => {
       const matchesSearch = log.username.toLowerCase().includes(searchTerm.toLowerCase()) || 
@@ -260,6 +468,37 @@ export default function App() {
     }
     return data;
   }, [logs]);
+
+  if (mustChangePassword) {
+    return (
+      <div className="min-h-screen bg-zinc-950 flex items-center justify-center p-4">
+        <Card className="w-full max-w-md bg-zinc-900 border-zinc-800 text-zinc-100">
+          <div className="p-8 space-y-6">
+            <div className="flex flex-col items-center space-y-2">
+              <div className="w-12 h-12 bg-zinc-800 rounded-full flex items-center justify-center mb-2 border border-zinc-700">
+                <Key className="w-6 h-6 text-zinc-100" />
+              </div>
+              <h1 className="text-2xl font-bold tracking-tight">Reset Password</h1>
+              <p className="text-zinc-500 text-sm text-center">You must change your password before continuing.</p>
+            </div>
+            <form onSubmit={handleChangePassword} className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-xs font-medium uppercase tracking-wider text-zinc-500">New Password</label>
+                <Input 
+                  type="password"
+                  placeholder="••••••••" 
+                  value={newPassword} 
+                  onChange={(e: any) => setNewPassword(e.target.value)} 
+                  required
+                />
+              </div>
+              <Button className="w-full" type="submit">Update Password</Button>
+            </form>
+          </div>
+        </Card>
+      </div>
+    );
+  }
 
   if (!user) {
     return (
@@ -319,6 +558,12 @@ export default function App() {
           <NavItem active={activeTab === "overview"} onClick={() => setActiveTab("overview")} icon={Activity}>Overview</NavItem>
           <NavItem active={activeTab === "logs"} onClick={() => setActiveTab("logs")} icon={Terminal}>Auth Logs</NavItem>
           <NavItem active={activeTab === "alerts"} onClick={() => setActiveTab("alerts")} icon={AlertTriangle}>Threats</NavItem>
+          {user.role === "admin" && (
+            <NavItem active={activeTab === "users"} onClick={() => setActiveTab("users")} icon={Users}>Users</NavItem>
+          )}
+          {user.role === "admin" && (
+            <NavItem active={activeTab === "audit"} onClick={() => setActiveTab("audit")} icon={History}>Audit Log</NavItem>
+          )}
           <NavItem active={activeTab === "settings"} onClick={() => setActiveTab("settings")} icon={Settings}>Settings</NavItem>
         </div>
         
@@ -502,6 +747,12 @@ export default function App() {
                   <Button variant={statusFilter === "all" ? "primary" : "secondary"} size="sm" onClick={() => setStatusFilter("all")}>All</Button>
                   <Button variant={statusFilter === "success" ? "primary" : "secondary"} size="sm" onClick={() => setStatusFilter("success")}>Success</Button>
                   <Button variant={statusFilter === "failed" ? "primary" : "secondary"} size="sm" onClick={() => setStatusFilter("failed")}>Failed</Button>
+                  {user.role === "admin" && (
+                    <div className="flex items-center gap-2 ml-4">
+                      <Button variant="secondary" size="sm" onClick={exportLogsCSV}>CSV</Button>
+                      <Button variant="secondary" size="sm" onClick={exportLogsPDF}>PDF</Button>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -539,8 +790,11 @@ export default function App() {
                               </Badge>
                             </td>
                             <td className="px-6 py-4 text-zinc-500 text-xs">{format(new Date(log.timestamp), "HH:mm:ss")}</td>
-                            {user.role === "admin" && (
-                              <td className="px-6 py-4 text-right">
+                            <td className="px-6 py-4 text-right space-x-2">
+                              <Button variant="ghost" size="icon" onClick={() => setSelectedLog(log)}>
+                                <Eye className="w-4 h-4" />
+                              </Button>
+                              {user.role === "admin" && (
                                 <Button 
                                   variant="ghost" 
                                   size="icon" 
@@ -549,8 +803,8 @@ export default function App() {
                                 >
                                   {blockedIPs.includes(log.ip) ? <ShieldCheck className="w-4 h-4" /> : <Ban className="w-4 h-4" />}
                                 </Button>
-                              </td>
-                            )}
+                              )}
+                            </td>
                           </motion.tr>
                         ))}
                       </AnimatePresence>
@@ -566,10 +820,19 @@ export default function App() {
               {alerts.map(alert => (
                 <Card key={alert.id} className={cn("p-6 border-l-4", alert.severity === "high" ? "border-l-red-500" : "border-l-orange-500")}>
                   <div className="flex items-start justify-between mb-4">
-                    <div className={cn("p-2 rounded-lg", alert.severity === "high" ? "bg-red-500/10 text-red-500" : "bg-orange-500/10 text-orange-500")}>
-                      <AlertTriangle className="w-5 h-5" />
+                    <div className={cn(
+                      "p-2 rounded-lg", 
+                      alert.type === "brute_force" ? "bg-red-500/10 text-red-500" : 
+                      alert.type === "unusual_location" ? "bg-purple-500/10 text-purple-500" :
+                      "bg-orange-500/10 text-orange-500"
+                    )}>
+                      {alert.type === "brute_force" ? <Zap className="w-5 h-5" /> : 
+                       alert.type === "unusual_location" ? <MapPin className="w-5 h-5" /> :
+                       <AlertTriangle className="w-5 h-5" />}
                     </div>
-                    <Badge variant={alert.severity === "high" ? "destructive" : "outline"}>{alert.severity}</Badge>
+                    <div title={`Severity: ${alert.severity.toUpperCase()}`}>
+                      <Badge variant={alert.severity === "high" ? "destructive" : "outline"}>{alert.severity}</Badge>
+                    </div>
                   </div>
                   <h4 className="font-bold text-lg mb-2 capitalize">{alert.type.replace("_", " ")}</h4>
                   <p className="text-sm text-zinc-400 mb-4">{alert.message}</p>
@@ -592,6 +855,104 @@ export default function App() {
                   <p className="text-sm">No suspicious activities detected in the last 24 hours.</p>
                 </div>
               )}
+            </div>
+          )}
+
+          {activeTab === "users" && user.role === "admin" && (
+            <div className="space-y-6">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xl font-bold">User Management</h3>
+                <Button onClick={() => {
+                  setEditingUser(null);
+                  setUserForm({ username: "", password: "", role: "viewer" });
+                  setIsUserModalOpen(true);
+                }}>
+                  <UserPlus className="w-4 h-4 mr-2" /> Add User
+                </Button>
+              </div>
+              <Card className="overflow-hidden">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-zinc-950 text-zinc-500 uppercase text-[10px] tracking-wider">
+                    <tr>
+                      <th className="px-6 py-3 font-medium">Username</th>
+                      <th className="px-6 py-3 font-medium">Role</th>
+                      <th className="px-6 py-3 font-medium">Created At</th>
+                      <th className="px-6 py-3 font-medium text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-800">
+                    {users.map(u => (
+                      <tr key={u.id} className="hover:bg-zinc-800/30 transition-colors">
+                        <td className="px-6 py-4 font-medium">{u.username}</td>
+                        <td className="px-6 py-4">
+                          <Badge variant={u.role === "admin" ? "default" : "outline"}>{u.role}</Badge>
+                        </td>
+                        <td className="px-6 py-4 text-zinc-500 text-xs">{format(new Date(u.createdAt), "MMM d, yyyy")}</td>
+                        <td className="px-6 py-4 text-right space-x-2">
+                          <Button variant="ghost" size="icon" title="Reset Password" onClick={() => handleResetPassword(u.id)}>
+                            <RefreshCw className="w-4 h-4" />
+                          </Button>
+                          <Button variant="ghost" size="icon" onClick={() => {
+                            setEditingUser(u);
+                            setUserForm({ username: u.username, password: "", role: u.role });
+                            setIsUserModalOpen(true);
+                          }}>
+                            <Edit2 className="w-4 h-4" />
+                          </Button>
+                          <Button variant="ghost" size="icon" className="text-red-500" onClick={() => handleDeleteUser(u.id)}>
+                            <Trash2 className="w-4 h-4" />
+                          </Button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </Card>
+            </div>
+          )}
+
+          {activeTab === "audit" && user.role === "admin" && (
+            <div className="space-y-6">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xl font-bold">Audit Trail</h3>
+                <Button variant="secondary" size="sm" onClick={fetchAuditLogs}>
+                  <RefreshCw className="w-4 h-4 mr-2" /> Refresh
+                </Button>
+              </div>
+              <Card className="overflow-hidden">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-zinc-950 text-zinc-500 uppercase text-[10px] tracking-wider">
+                    <tr>
+                      <th className="px-6 py-3 font-medium">Admin</th>
+                      <th className="px-6 py-3 font-medium">Action</th>
+                      <th className="px-6 py-3 font-medium">Target User</th>
+                      <th className="px-6 py-3 font-medium">Timestamp</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-800">
+                    {auditLogs.map(log => (
+                      <tr key={log.id} className="hover:bg-zinc-800/30 transition-colors">
+                        <td className="px-6 py-4 font-medium">{log.adminUsername}</td>
+                        <td className="px-6 py-4">
+                          <Badge variant={
+                            log.action.includes("DELETE") ? "destructive" : 
+                            log.action.includes("CREATE") ? "secondary" : "outline"
+                          }>
+                            {log.action.replace("_", " ")}
+                          </Badge>
+                        </td>
+                        <td className="px-6 py-4 text-zinc-400">{log.targetUsername}</td>
+                        <td className="px-6 py-4 text-zinc-500 text-xs">{format(new Date(log.timestamp), "yyyy-MM-dd HH:mm:ss")}</td>
+                      </tr>
+                    ))}
+                    {auditLogs.length === 0 && (
+                      <tr>
+                        <td colSpan={4} className="px-6 py-12 text-center text-zinc-600">No audit logs found.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </Card>
             </div>
           )}
 
@@ -658,6 +1019,102 @@ export default function App() {
           )}
         </div>
       </main>
+
+      {/* Log Detail Modal */}
+      <AnimatePresence>
+        {selectedLog && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-lg overflow-hidden shadow-2xl"
+            >
+              <div className="p-6 border-b border-zinc-800 flex items-center justify-between">
+                <h3 className="text-lg font-bold">Log Entry Details</h3>
+                <Button variant="ghost" size="icon" onClick={() => setSelectedLog(null)}>
+                  <ShieldX className="w-4 h-4" />
+                </Button>
+              </div>
+              <div className="p-6 space-y-4">
+                <DetailRow label="ID" value={selectedLog.id} />
+                <DetailRow label="Timestamp" value={format(new Date(selectedLog.timestamp), "yyyy-MM-dd HH:mm:ss")} />
+                <DetailRow label="Username" value={selectedLog.username} />
+                <DetailRow label="IP Address" value={selectedLog.ip} />
+                <DetailRow label="Location" value={selectedLog.location} />
+                <div className="flex items-center justify-between py-2">
+                  <span className="text-xs text-zinc-500 uppercase font-bold">Status</span>
+                  <Badge variant={selectedLog.status === "success" ? "secondary" : "destructive"}>
+                    {selectedLog.status}
+                  </Badge>
+                </div>
+              </div>
+              <div className="p-6 bg-zinc-950/50 border-t border-zinc-800">
+                <Button className="w-full" onClick={() => setSelectedLog(null)}>Close</Button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* User Modal */}
+      <AnimatePresence>
+        {isUserModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md overflow-hidden shadow-2xl"
+            >
+              <div className="p-6 border-b border-zinc-800">
+                <h3 className="text-lg font-bold">{editingUser ? "Edit User" : "Create New User"}</h3>
+              </div>
+              <div className="p-6 space-y-4">
+                <div className="space-y-2">
+                  <label className="text-xs font-bold uppercase text-zinc-500">Username</label>
+                  <Input 
+                    value={userForm.username} 
+                    onChange={(e: any) => setUserForm({ ...userForm, username: e.target.value })} 
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-bold uppercase text-zinc-500">Password {editingUser && "(Leave blank to keep current)"}</label>
+                  <Input 
+                    type="password"
+                    value={userForm.password} 
+                    onChange={(e: any) => setUserForm({ ...userForm, password: e.target.value })} 
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-bold uppercase text-zinc-500">Role</label>
+                  <select 
+                    className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-700"
+                    value={userForm.role}
+                    onChange={(e) => setUserForm({ ...userForm, role: e.target.value as any })}
+                  >
+                    <option value="viewer">Viewer</option>
+                    <option value="admin">Admin</option>
+                  </select>
+                </div>
+              </div>
+              <div className="p-6 bg-zinc-950/50 border-t border-zinc-800 flex gap-3">
+                <Button variant="secondary" className="flex-1" onClick={() => setIsUserModalOpen(false)}>Cancel</Button>
+                <Button className="flex-1" onClick={handleSaveUser}>Save User</Button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function DetailRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between py-2 border-b border-zinc-800/50 last:border-0">
+      <span className="text-xs text-zinc-500 uppercase font-bold">{label}</span>
+      <span className="text-sm font-medium">{value}</span>
     </div>
   );
 }

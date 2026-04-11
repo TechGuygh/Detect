@@ -20,16 +20,82 @@ const io = new Server(httpServer, {
 });
 
 const PORT = 3000;
-const JWT_SECRET = "sentinel-secret-key";
+const JWT_SECRET = process.env.JWT_SECRET || "sentinel-secret-key";
 
-app.use(cors());
-app.use(express.json());
+const apiRouter = express.Router();
 
 // Mock Data
 let logs: any[] = [];
 let alerts: any[] = [];
+let auditLogs: any[] = [];
 let blockedIPs = new Set<string>();
 let failedAttempts: Record<string, { count: number; lastAttempt: number }> = {};
+
+// User Management Data
+let users = [
+  {
+    id: "1",
+    username: "admin",
+    password: bcrypt.hashSync("password", 10),
+    role: "admin",
+    createdAt: new Date().toISOString(),
+    mustChangePassword: false
+  },
+  {
+    id: "2",
+    username: "viewer",
+    password: bcrypt.hashSync("password", 10),
+    role: "viewer",
+    createdAt: new Date().toISOString(),
+    mustChangePassword: false
+  }
+];
+
+// Helper for Audit Logging
+const logAudit = (adminUsername: string, action: string, targetUsername: string) => {
+  auditLogs.unshift({
+    id: Math.random().toString(36).substr(2, 9),
+    adminUsername,
+    action,
+    targetUsername,
+    timestamp: new Date().toISOString()
+  });
+  if (auditLogs.length > 200) auditLogs.pop();
+};
+
+// Middleware
+const authenticateJWT = (req: any, res: any, next: any) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader) {
+    const token = authHeader.split(" ")[1];
+    jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
+      if (err) return res.sendStatus(403);
+      req.user = user;
+      next();
+    });
+  } else {
+    res.sendStatus(401);
+  }
+};
+
+const authorizeRole = (role: string) => {
+  return (req: any, res: any, next: any) => {
+    if (req.user && req.user.role === role) {
+      next();
+    } else {
+      res.status(403).json({ error: "Forbidden: Insufficient permissions" });
+    }
+  };
+};
+
+app.use(cors());
+app.use(express.json());
+
+// Request logger
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.url}`);
+  next();
+});
 
 // Helper to generate random logs
 const usernames = ["admin", "user1", "guest", "dev_ops", "security_bot", "unknown"];
@@ -114,20 +180,113 @@ function detectThreats(log: any) {
 }
 
 // API Routes
-app.post("/api/login", (req, res) => {
+apiRouter.post("/login", (req, res) => {
   const { username, password } = req.body;
-  // Simple mock auth
-  if (password === "password") {
-    const role = username === "admin" ? "admin" : "viewer";
-    const token = jwt.sign({ username, role }, JWT_SECRET, { expiresIn: "1h" });
-    return res.json({ token, role, username });
+  const user = users.find(u => u.username === username);
+  
+  if (user && bcrypt.compareSync(password, user.password)) {
+    const token = jwt.sign({ 
+      id: user.id, 
+      username: user.username, 
+      role: user.role,
+      mustChangePassword: user.mustChangePassword 
+    }, JWT_SECRET, { expiresIn: "1h" });
+    
+    return res.json({ 
+      token, 
+      role: user.role, 
+      username: user.username,
+      mustChangePassword: user.mustChangePassword 
+    });
   }
   res.status(401).json({ error: "Invalid credentials" });
 });
 
-app.get("/api/logs", (req, res) => res.json(logs));
-app.get("/api/alerts", (req, res) => res.json(alerts));
-app.get("/api/stats", (req, res) => {
+apiRouter.post("/change-password", authenticateJWT, (req: any, res) => {
+  const { newPassword } = req.body;
+  const userIndex = users.findIndex(u => u.id === req.user.id);
+  if (userIndex === -1) return res.status(404).json({ error: "User not found" });
+
+  users[userIndex].password = bcrypt.hashSync(newPassword, 10);
+  users[userIndex].mustChangePassword = false;
+
+  res.json({ success: true });
+});
+
+apiRouter.get("/users", authenticateJWT, authorizeRole("admin"), (req, res) => {
+  const usersWithoutPasswords = users.map(({ password, ...u }) => u);
+  res.json(usersWithoutPasswords);
+});
+
+apiRouter.post("/users", authenticateJWT, authorizeRole("admin"), (req: any, res) => {
+  const { username, password, role } = req.body;
+  if (users.find(u => u.username === username)) {
+    return res.status(400).json({ error: "Username already exists" });
+  }
+  const newUser = {
+    id: Math.random().toString(36).substr(2, 9),
+    username,
+    password: bcrypt.hashSync(password, 10),
+    role,
+    createdAt: new Date().toISOString(),
+    mustChangePassword: false
+  };
+  users.push(newUser);
+  logAudit(req.user.username, "CREATE_USER", username);
+  res.status(201).json({ id: newUser.id, username: newUser.username, role: newUser.role });
+});
+
+apiRouter.put("/users/:id", authenticateJWT, authorizeRole("admin"), (req: any, res) => {
+  const { id } = req.params;
+  const { username, password, role } = req.body;
+  const userIndex = users.findIndex(u => u.id === id);
+  if (userIndex === -1) return res.status(404).json({ error: "User not found" });
+
+  const oldUsername = users[userIndex].username;
+  if (username) users[userIndex].username = username;
+  if (role) users[userIndex].role = role;
+  if (password) users[userIndex].password = bcrypt.hashSync(password, 10);
+
+  logAudit(req.user.username, "UPDATE_USER", username || oldUsername);
+  const { password: _, ...updatedUser } = users[userIndex];
+  res.json(updatedUser);
+});
+
+apiRouter.delete("/users/:id", authenticateJWT, authorizeRole("admin"), (req: any, res) => {
+  const { id } = req.params;
+  const userIndex = users.findIndex(u => u.id === id);
+  if (userIndex === -1) return res.status(404).json({ error: "User not found" });
+  
+  const targetUsername = users[userIndex].username;
+  if (req.user.id === id) {
+    return res.status(400).json({ error: "You cannot delete your own account" });
+  }
+
+  users.splice(userIndex, 1);
+  logAudit(req.user.username, "DELETE_USER", targetUsername);
+  res.sendStatus(204);
+});
+
+apiRouter.post("/users/:id/reset-password", authenticateJWT, authorizeRole("admin"), (req: any, res) => {
+  const { id } = req.params;
+  const userIndex = users.findIndex(u => u.id === id);
+  if (userIndex === -1) return res.status(404).json({ error: "User not found" });
+
+  const tempPassword = Math.random().toString(36).substr(2, 8);
+  users[userIndex].password = bcrypt.hashSync(tempPassword, 10);
+  users[userIndex].mustChangePassword = true;
+
+  logAudit(req.user.username, "RESET_PASSWORD", users[userIndex].username);
+  res.json({ tempPassword });
+});
+
+apiRouter.get("/audit-logs", authenticateJWT, authorizeRole("admin"), (req, res) => {
+  res.json(auditLogs);
+});
+
+apiRouter.get("/logs", (req, res) => res.json(logs));
+apiRouter.get("/alerts", (req, res) => res.json(alerts));
+apiRouter.get("/stats", (req, res) => {
   res.json({
     total: logs.length,
     failed: logs.filter(l => l.status === "failed").length,
@@ -136,19 +295,23 @@ app.get("/api/stats", (req, res) => {
   });
 });
 
-app.post("/api/block-ip", (req, res) => {
+apiRouter.post("/block-ip", (req, res) => {
   const { ip } = req.body;
   blockedIPs.add(ip);
   io.emit("ip_blocked", ip);
   res.json({ success: true });
 });
 
-app.post("/api/unblock-ip", (req, res) => {
+apiRouter.post("/unblock-ip", (req, res) => {
   const { ip } = req.body;
   blockedIPs.delete(ip);
   io.emit("ip_unblocked", ip);
   res.json({ success: true });
 });
+
+apiRouter.get("/health", (req, res) => res.json({ status: "ok" }));
+
+app.use("/api", apiRouter);
 
 // Real-time loop
 setInterval(() => {
