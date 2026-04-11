@@ -1,259 +1,164 @@
 import express from "express";
 import { createServer } from "http";
 import { Server } from "socket.io";
-import { createServer as createViteServer } from "vite";
 import path from "path";
+import { fileURLToPath } from "url";
 import cors from "cors";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import { createServer as createViteServer } from "vite";
 
-const JWT_SECRET = process.env.JWT_SECRET || "super-secret-sentinel-key";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-interface LogEntry {
-  id: string;
-  username: string;
-  ip: string;
-  timestamp: string;
-  status: "success" | "failed";
-  location: string;
-}
+const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: {
+    origin: "*",
+  },
+});
 
-interface Alert {
-  id: string;
-  type: "brute_force" | "rapid_login" | "unusual_location";
-  severity: "low" | "medium" | "high";
-  message: string;
-  timestamp: string;
-  ip: string;
-}
+const PORT = 3000;
+const JWT_SECRET = "sentinel-secret-key";
 
-const logs: LogEntry[] = [];
-const alerts: Alert[] = [];
-const blockedIPs = new Set<string>();
+app.use(cors());
+app.use(express.json());
 
-interface UserAccount {
-  id: string;
-  username: string;
-  role: "admin" | "viewer";
-  createdAt: string;
-}
+// Mock Data
+let logs: any[] = [];
+let alerts: any[] = [];
+let blockedIPs = new Set<string>();
+let failedAttempts: Record<string, { count: number; lastAttempt: number }> = {};
 
-const users: UserAccount[] = [
-  { id: "1", username: "admin", role: "admin", createdAt: new Date().toISOString() },
-  { id: "2", username: "viewer", role: "viewer", createdAt: new Date().toISOString() },
-];
-
-interface SecurityConfig {
-  failedAttemptThreshold: number;
-  autoBlockEnabled: boolean;
-  blockedIPRanges: string[];
-}
-
-let securityConfig: SecurityConfig = {
-  failedAttemptThreshold: 3,
-  autoBlockEnabled: true,
-  blockedIPRanges: [],
-};
-
-// Mock data generator
-const USERNAMES = ["admin", "jdoe", "msmith", "root", "guest", "dev_ops"];
-const IPS = ["192.168.1.1", "10.0.0.5", "172.16.0.10", "45.33.22.11", "88.99.100.121"];
-const LOCATIONS = ["New York, US", "London, UK", "Tokyo, JP", "Berlin, DE", "Moscow, RU", "Beijing, CN"];
+// Helper to generate random logs
+const usernames = ["admin", "user1", "guest", "dev_ops", "security_bot", "unknown"];
+const locations = ["New York, USA", "London, UK", "Tokyo, JP", "Berlin, DE", "Accra, GH", "Moscow, RU"];
+const ips = ["192.168.1.1", "10.0.0.5", "172.16.0.10", "45.12.33.1", "88.201.5.12", "203.0.113.42"];
 
 function generateLog() {
-  const ip = IPS[Math.floor(Math.random() * IPS.length)];
+  const isFailed = Math.random() > 0.7;
+  const ip = ips[Math.floor(Math.random() * ips.length)];
   
   if (blockedIPs.has(ip)) return null;
 
-  const status = Math.random() > 0.3 ? "success" : "failed";
-  const log: LogEntry = {
+  const log = {
     id: Math.random().toString(36).substr(2, 9),
-    username: USERNAMES[Math.floor(Math.random() * USERNAMES.length)],
-    ip,
+    username: usernames[Math.floor(Math.random() * usernames.length)],
+    ip: ip,
     timestamp: new Date().toISOString(),
-    status,
-    location: LOCATIONS[Math.floor(Math.random() * LOCATIONS.length)],
+    status: isFailed ? "failed" : "success",
+    location: locations[Math.floor(Math.random() * locations.length)],
   };
-  
+
   logs.unshift(log);
   if (logs.length > 100) logs.pop();
-  
-  detectSuspicious(log);
-  
+
+  // Threat Detection Logic
+  detectThreats(log);
+
   return log;
 }
 
-function detectSuspicious(log: LogEntry) {
-  // Brute force: X failed attempts from same IP in last 1 min
-  const recentFailed = logs.filter(l => 
-    l.ip === log.ip && 
-    l.status === "failed" && 
-    (new Date().getTime() - new Date(l.timestamp).getTime()) < 60000
-  );
+function detectThreats(log: any) {
+  const now = Date.now();
 
-  if (recentFailed.length >= securityConfig.failedAttemptThreshold) {
-    const alert: Alert = {
-      id: Math.random().toString(36).substr(2, 9),
-      type: "brute_force",
-      severity: "high",
-      message: `Brute force detected from IP ${log.ip} (${recentFailed.length} failed attempts)`,
-      timestamp: new Date().toISOString(),
-      ip: log.ip
-    };
+  // 1. Brute Force Detection
+  if (log.status === "failed") {
+    if (!failedAttempts[log.ip]) {
+      failedAttempts[log.ip] = { count: 0, lastAttempt: now };
+    }
     
-    if (!alerts.find(a => a.ip === log.ip && a.type === "brute_force")) {
+    const timeDiff = now - failedAttempts[log.ip].lastAttempt;
+    if (timeDiff < 60000) { // 1 minute window
+      failedAttempts[log.ip].count++;
+    } else {
+      failedAttempts[log.ip].count = 1;
+    }
+    failedAttempts[log.ip].lastAttempt = now;
+
+    if (failedAttempts[log.ip].count >= 5) {
+      const alert = {
+        id: Math.random().toString(36).substr(2, 9),
+        type: "brute_force",
+        severity: "high",
+        message: `Brute force attack detected from IP ${log.ip}. 5+ failed attempts in 1 min.`,
+        timestamp: new Date().toISOString(),
+        ip: log.ip,
+      };
       alerts.unshift(alert);
+      io.emit("new_alert", alert);
       
-      // Auto-block if enabled
-      if (securityConfig.autoBlockEnabled) {
-        blockedIPs.add(log.ip);
-        // We'll need access to 'io' here, so we'll handle emission in the caller or pass io
-      }
+      // Auto-block simulation
+      blockedIPs.add(log.ip);
+      io.emit("ip_blocked", log.ip);
+      
+      // Reset counter after block
+      failedAttempts[log.ip].count = 0;
     }
   }
 
-  // Unusual location
-  if (log.location.includes("Moscow") || log.location.includes("Beijing")) {
-    const alert: Alert = {
+  // 2. Unusual Location Detection (Simulated)
+  if (log.location === "Moscow, RU" && log.username === "admin") {
+    const alert = {
       id: Math.random().toString(36).substr(2, 9),
       type: "unusual_location",
       severity: "medium",
-      message: `Unusual login location: ${log.location} for user ${log.username}`,
+      message: `Admin login attempt from unusual location: ${log.location}`,
       timestamp: new Date().toISOString(),
-      ip: log.ip
+      ip: log.ip,
     };
     alerts.unshift(alert);
+    io.emit("new_alert", alert);
   }
 }
 
+// API Routes
+app.post("/api/login", (req, res) => {
+  const { username, password } = req.body;
+  // Simple mock auth
+  if (password === "password") {
+    const role = username === "admin" ? "admin" : "viewer";
+    const token = jwt.sign({ username, role }, JWT_SECRET, { expiresIn: "1h" });
+    return res.json({ token, role, username });
+  }
+  res.status(401).json({ error: "Invalid credentials" });
+});
+
+app.get("/api/logs", (req, res) => res.json(logs));
+app.get("/api/alerts", (req, res) => res.json(alerts));
+app.get("/api/stats", (req, res) => {
+  res.json({
+    total: logs.length,
+    failed: logs.filter(l => l.status === "failed").length,
+    highRisk: alerts.filter(a => a.severity === "high").length,
+    blocked: blockedIPs.size,
+  });
+});
+
+app.post("/api/block-ip", (req, res) => {
+  const { ip } = req.body;
+  blockedIPs.add(ip);
+  io.emit("ip_blocked", ip);
+  res.json({ success: true });
+});
+
+app.post("/api/unblock-ip", (req, res) => {
+  const { ip } = req.body;
+  blockedIPs.delete(ip);
+  io.emit("ip_unblocked", ip);
+  res.json({ success: true });
+});
+
+// Real-time loop
+setInterval(() => {
+  const log = generateLog();
+  if (log) {
+    io.emit("new_log", log);
+  }
+}, 3000);
+
 async function startServer() {
-  const app = express();
-  const httpServer = createServer(app);
-  const io = new Server(httpServer, {
-    cors: {
-      origin: "*",
-    },
-  });
-
-  app.use(cors());
-  app.use(express.json());
-
-  // API Routes
-  app.post("/api/login", (req, res) => {
-    const { username, password } = req.body;
-    const user = users.find(u => u.username === username);
-    if (user && password === "password") {
-      const token = jwt.sign({ username: user.username, role: user.role }, JWT_SECRET, { expiresIn: "1h" });
-      return res.json({ token, role: user.role, username: user.username });
-    }
-    res.status(401).json({ error: "Invalid credentials" });
-  });
-
-  // User Management
-  app.get("/api/users", (req, res) => res.json(users));
-  app.post("/api/users", (req, res) => {
-    const { username, role } = req.body;
-    const newUser: UserAccount = {
-      id: Math.random().toString(36).substr(2, 9),
-      username,
-      role,
-      createdAt: new Date().toISOString()
-    };
-    users.push(newUser);
-    res.json(newUser);
-  });
-  app.put("/api/users/:id", (req, res) => {
-    const { id } = req.params;
-    const { username, role } = req.body;
-    const index = users.findIndex(u => u.id === id);
-    if (index !== -1) {
-      users[index] = { ...users[index], username, role };
-      res.json(users[index]);
-    } else {
-      res.status(404).json({ error: "User not found" });
-    }
-  });
-  app.delete("/api/users/:id", (req, res) => {
-    const { id } = req.params;
-    const index = users.findIndex(u => u.id === id);
-    if (index !== -1) {
-      users.splice(index, 1);
-      res.json({ success: true });
-    } else {
-      res.status(404).json({ error: "User not found" });
-    }
-  });
-
-  // Config
-  app.get("/api/config", (req, res) => res.json(securityConfig));
-  app.post("/api/config", (req, res) => {
-    securityConfig = { ...securityConfig, ...req.body };
-    io.emit("config_updated", securityConfig);
-    res.json(securityConfig);
-  });
-
-  app.get("/api/logs", (req, res) => {
-    res.json(logs);
-  });
-
-  app.get("/api/alerts", (req, res) => {
-    res.json(alerts);
-  });
-
-  app.post("/api/block-ip", (req, res) => {
-    const { ip } = req.body;
-    if (ip) {
-      blockedIPs.add(ip);
-      io.emit("ip_blocked", ip);
-      res.json({ success: true, blockedIPs: Array.from(blockedIPs) });
-    } else {
-      res.status(400).json({ error: "IP is required" });
-    }
-  });
-
-  app.post("/api/unblock-ip", (req, res) => {
-    const { ip } = req.body;
-    if (ip) {
-      blockedIPs.delete(ip);
-      io.emit("ip_unblocked", ip);
-      res.json({ success: true, blockedIPs: Array.from(blockedIPs) });
-    } else {
-      res.status(400).json({ error: "IP is required" });
-    }
-  });
-
-  app.get("/api/stats", (req, res) => {
-    const totalLogins = logs.length;
-    const failedAttempts = logs.filter(l => l.status === "failed").length;
-    const activeThreats = alerts.length;
-    res.json({ totalLogins, failedAttempts, activeThreats, blockedCount: blockedIPs.size });
-  });
-
-  // Socket.io
-  io.on("connection", (socket) => {
-    console.log("Client connected");
-    socket.emit("initial_logs", logs);
-    socket.emit("initial_alerts", alerts);
-    socket.emit("initial_blocked_ips", Array.from(blockedIPs));
-    socket.emit("initial_config", securityConfig);
-  });
-
-  // Simulator
-  setInterval(() => {
-    const log = generateLog();
-    if (log) {
-      io.emit("new_log", log);
-      // Check if detection auto-blocked
-      if (blockedIPs.has(log.ip)) {
-        io.emit("ip_blocked", log.ip);
-      }
-    }
-    if (alerts.length > 0) {
-      io.emit("new_alert", alerts[0]);
-    }
-  }, 5000);
-
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -268,9 +173,8 @@ async function startServer() {
     });
   }
 
-  const PORT = 3000;
   httpServer.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Security Server running on http://localhost:${PORT}`);
   });
 }
 
