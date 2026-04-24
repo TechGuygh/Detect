@@ -1,0 +1,131 @@
+{
+  "entities": {
+    "users": {
+      "title": "User",
+      "description": "User profile and role information",
+      "type": "object",
+      "properties": {
+        "username": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "viewer"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "email": { "type": "string", "format": "email" },
+        "typicalLocations": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["username", "role", "createdAt", "email"]
+    },
+    "logs": {
+      "title": "Log Entry",
+      "description": "Authentication attempt log",
+      "type": "object",
+      "properties": {
+        "username": { "type": "string" },
+        "ip": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "status": { "type": "string", "enum": ["success", "failed"] },
+        "location": { "type": "string" },
+        "city": { "type": "string" },
+        "country": { "type": "string" },
+        "countryCode": { "type": "string" },
+        "lat": { "type": "number" },
+        "lon": { "type": "number" },
+        "riskScore": { "type": "number" }
+      },
+      "required": ["username", "ip", "timestamp", "status", "location"]
+    },
+    "alerts": {
+      "title": "Alert",
+      "description": "Security threat alert",
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "severity": { "type": "string", "enum": ["low", "medium", "high"] },
+        "message": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "ip": { "type": "string" },
+        "location": { "type": "string" }
+      },
+      "required": ["type", "severity", "message", "timestamp", "ip"]
+    },
+    "auditLogs": {
+      "title": "Audit Log",
+      "description": "Admin action audit trail",
+      "type": "object",
+      "properties": {
+        "adminUsername": { "type": "string" },
+        "action": { "type": "string" },
+        "targetUsername": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["adminUsername", "action", "targetUsername", "timestamp"]
+    },
+    "blockedIPs": {
+      "title": "Blocked IP",
+      "description": "List of blocked IP addresses",
+      "type": "object",
+      "properties": {
+        "ip": { "type": "string" },
+        "blockedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ip", "blockedAt"]
+    },
+    "settings": {
+      "title": "System Settings",
+      "description": "Global configuration settings",
+      "type": "object",
+      "properties": {
+        "bruteForceAttempts": { "type": "number" },
+        "bruteForceTimeframe": { "type": "number" },
+        "riskScoreThreshold": { "type": "number" },
+        "autoBlockEnabled": { "type": "boolean" },
+        "realtimeNotifications": { "type": "boolean" }
+      },
+      "required": ["bruteForceAttempts", "bruteForceTimeframe", "riskScoreThreshold", "autoBlockEnabled", "realtimeNotifications"]
+    },
+    "activityLogs": {
+      "title": "Activity Log",
+      "description": "User web activity and site access log",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "username": { "type": "string" },
+        "url": { "type": "string" },
+        "category": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "ip": { "type": "string" },
+        "action": { "type": "string", "enum": ["allowed", "blocked", "flagged"] },
+        "duration": { "type": "number" }
+      },
+      "required": ["userId", "username", "url", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "users",
+      "description": "User profile documents"
+    },
+    "/logs/{logId}": {
+      "schema": "logs",
+      "description": "Security log entries"
+    },
+    "/alerts/{alertId}": {
+      "schema": "alerts",
+      "description": "Security alerts"
+    },
+    "/auditLogs/{auditId}": {
+      "schema": "auditLogs",
+      "description": "Admin audit trail"
+    },
+    "/blockedIPs/{ipId}": {
+      "schema": "blockedIPs",
+      "description": "Blocked IP addresses"
+    },
+    "/settings/{settingId}": {
+      "schema": "settings",
+      "description": "Global configuration settings"
+    },
+    "/activityLogs/{activityId}": {
+      "schema": "activityLogs",
+      "description": "User web activity logs"
+    }
+  }
+}

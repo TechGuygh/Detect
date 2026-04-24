@@ -1,0 +1,149 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Fields:
+    //   - username: string (required)
+    //   - role: string (required, ['admin', 'viewer'])
+    //   - createdAt: string (required)
+    //   - email: string (required)
+    //
+    // Collection: logs
+    // Fields:
+    //   - username: string
+    //   - ip: string
+    //   - timestamp: string
+    //   - status: string
+    //   - location: string
+    //
+    // Collection: alerts
+    // Fields:
+    //   - type: string
+    //   - severity: string
+    //   - message: string
+    //   - timestamp: string
+    //   - ip: string
+    //
+    // Collection: auditLogs
+    // Fields:
+    //   - adminUsername: string
+    //   - action: string
+    //   - targetUsername: string
+    //   - timestamp: string
+    //
+    // Collection: blockedIPs
+    // Fields:
+    //   - ip: string
+    //   - blockedAt: string
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && 
+        (request.auth.token.email == 'aidoo@gmail.com' ||
+         request.auth.token.email == 'aidooemmanuel038@gmail.com' ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin');
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['username', 'role', 'createdAt', 'email']) &&
+             data.username is string && data.username.size() > 0 && data.username.size() < 50 &&
+             data.role in ['admin', 'viewer'] &&
+             data.email is string && data.email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$") &&
+             (!data.keys().contains('typicalLocations') || data.typicalLocations is list);
+    }
+
+    function isValidSettings(data) {
+      return data.keys().hasAll(['bruteForceAttempts', 'bruteForceTimeframe', 'riskScoreThreshold', 'autoBlockEnabled', 'realtimeNotifications']) &&
+             data.bruteForceAttempts is number && data.bruteForceAttempts > 0 &&
+             data.bruteForceTimeframe is number && data.bruteForceTimeframe > 0 &&
+             data.riskScoreThreshold is number && data.riskScoreThreshold > 0 && data.riskScoreThreshold <= 100 &&
+             data.autoBlockEnabled is bool &&
+             data.realtimeNotifications is bool;
+    }
+
+    function isValidLog(data) {
+      return data.keys().hasAll(['username', 'ip', 'timestamp', 'status', 'location']) &&
+             data.username is string &&
+             data.ip is string &&
+             data.status in ['success', 'failed'] &&
+             data.location is string;
+    }
+
+    function isValidAlert(data) {
+      return data.keys().hasAll(['type', 'severity', 'message', 'timestamp', 'ip']) &&
+             data.type is string &&
+             data.severity in ['low', 'medium', 'high'] &&
+             data.message is string &&
+             data.ip is string;
+    }
+
+    function isValidActivity(data) {
+      return data.keys().hasAll(['userId', 'username', 'url', 'timestamp']) &&
+             data.userId is string &&
+             data.username is string &&
+             data.url is string;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && (isOwner(userId) || isAdmin()) && isValidUser(request.resource.data);
+      allow update: if isAuthenticated() && (isOwner(userId) || isAdmin()) && isValidUser(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /logs/{logId} {
+      allow read: if isAuthenticated();
+      allow create: if isValidLog(request.resource.data);
+      allow update, delete: if isAdmin();
+    }
+
+    match /alerts/{alertId} {
+      allow read: if isAuthenticated();
+      allow create: if isValidAlert(request.resource.data);
+      allow update, delete: if isAdmin();
+    }
+
+    match /auditLogs/{auditId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    match /blockedIPs/{ipId} {
+      allow read: if isAuthenticated();
+      allow create: if true; // Allow auto-blocking
+      allow update, delete: if isAdmin();
+    }
+
+    match /settings/{settingId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() && isValidSettings(request.resource.data);
+    }
+
+    match /activityLogs/{activityId} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+  }
+}

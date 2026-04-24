@@ -1,325 +1,205 @@
 import express from "express";
 import { createServer } from "http";
-import { Server } from "socket.io";
 import path from "path";
 import { fileURLToPath } from "url";
 import cors from "cors";
-import jwt from "jsonwebtoken";
-import bcrypt from "bcryptjs";
 import { createServer as createViteServer } from "vite";
+import nodemailer from "nodemailer";
+import rateLimit from "express-rate-limit";
+import axios from "axios";
+import multer from "multer";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const upload = multer({ storage: multer.memoryStorage() });
+
 const app = express();
 const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: "*",
-  },
-});
 
 const PORT = 3000;
-const JWT_SECRET = process.env.JWT_SECRET || "sentinel-secret-key";
 
-const apiRouter = express.Router();
-
-// Mock Data
-let logs: any[] = [];
-let alerts: any[] = [];
-let auditLogs: any[] = [];
-let blockedIPs = new Set<string>();
-let failedAttempts: Record<string, { count: number; lastAttempt: number }> = {};
-
-// User Management Data
-let users = [
-  {
-    id: "1",
-    username: "admin",
-    password: bcrypt.hashSync("password", 10),
-    role: "admin",
-    createdAt: new Date().toISOString(),
-    mustChangePassword: false
-  },
-  {
-    id: "2",
-    username: "viewer",
-    password: bcrypt.hashSync("password", 10),
-    role: "viewer",
-    createdAt: new Date().toISOString(),
-    mustChangePassword: false
+// Rate Limiter: General API
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, 
+  max: 1000, 
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ error: "Too many requests from this IP, please try again after 15 minutes." });
   }
-];
+});
 
-// Helper for Audit Logging
-const logAudit = (adminUsername: string, action: string, targetUsername: string) => {
-  auditLogs.unshift({
-    id: Math.random().toString(36).substr(2, 9),
-    adminUsername,
-    action,
-    targetUsername,
-    timestamp: new Date().toISOString()
-  });
-  if (auditLogs.length > 200) auditLogs.pop();
-};
-
-// Middleware
-const authenticateJWT = (req: any, res: any, next: any) => {
-  const authHeader = req.headers.authorization;
-  if (authHeader) {
-    const token = authHeader.split(" ")[1];
-    jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
-      if (err) return res.sendStatus(403);
-      req.user = user;
-      next();
-    });
-  } else {
-    res.sendStatus(401);
+// Rate Limiter: VirusTotal Proxies
+const vtLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 500, 
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ error: "Security scan quota exceeded for this hour." });
   }
-};
+});
 
-const authorizeRole = (role: string) => {
-  return (req: any, res: any, next: any) => {
-    if (req.user && req.user.role === role) {
-      next();
-    } else {
-      res.status(403).json({ error: "Forbidden: Insufficient permissions" });
-    }
-  };
-};
+// Rate Limiter: Strict for Notifications (prevent spam)
+const notifyLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10, // Limit each IP to 10 notifications per hour
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ error: "Notification quota exceeded for this hour." });
+  }
+});
 
 app.use(cors());
 app.use(express.json());
 
+// General API Rate Limiter
+app.use("/api", apiLimiter);
+
+// Specific Rate Limiters
+app.use("/api/notify", notifyLimiter);
+app.use("/api/scan", vtLimiter);
+
 // Request logger
 app.use((req, res, next) => {
-  console.log(`${req.method} ${req.url}`);
+  if (req.url.startsWith("/api")) {
+    console.log(`[API] ${req.method} ${req.url}`);
+  }
   next();
 });
 
-// Helper to generate random logs
-const usernames = ["admin", "user1", "guest", "dev_ops", "security_bot", "unknown"];
-const locations = ["New York, USA", "London, UK", "Tokyo, JP", "Berlin, DE", "Accra, GH", "Moscow, RU"];
-const ips = ["192.168.1.1", "10.0.0.5", "172.16.0.10", "45.12.33.1", "88.201.5.12", "203.0.113.42"];
+// Health check
+app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
-function generateLog() {
-  const isFailed = Math.random() > 0.7;
-  const ip = ips[Math.floor(Math.random() * ips.length)];
-  
-  if (blockedIPs.has(ip)) return null;
-
-  const log = {
-    id: Math.random().toString(36).substr(2, 9),
-    username: usernames[Math.floor(Math.random() * usernames.length)],
-    ip: ip,
-    timestamp: new Date().toISOString(),
-    status: isFailed ? "failed" : "success",
-    location: locations[Math.floor(Math.random() * locations.length)],
-  };
-
-  logs.unshift(log);
-  if (logs.length > 100) logs.pop();
-
-  // Threat Detection Logic
-  detectThreats(log);
-
-  return log;
-}
-
-function detectThreats(log: any) {
-  const now = Date.now();
-
-  // 1. Brute Force Detection
-  if (log.status === "failed") {
-    if (!failedAttempts[log.ip]) {
-      failedAttempts[log.ip] = { count: 0, lastAttempt: now };
-    }
-    
-    const timeDiff = now - failedAttempts[log.ip].lastAttempt;
-    if (timeDiff < 60000) { // 1 minute window
-      failedAttempts[log.ip].count++;
-    } else {
-      failedAttempts[log.ip].count = 1;
-    }
-    failedAttempts[log.ip].lastAttempt = now;
-
-    if (failedAttempts[log.ip].count >= 5) {
-      const alert = {
-        id: Math.random().toString(36).substr(2, 9),
-        type: "brute_force",
-        severity: "high",
-        message: `Brute force attack detected from IP ${log.ip}. 5+ failed attempts in 1 min.`,
-        timestamp: new Date().toISOString(),
-        ip: log.ip,
-      };
-      alerts.unshift(alert);
-      io.emit("new_alert", alert);
-      
-      // Auto-block simulation
-      blockedIPs.add(log.ip);
-      io.emit("ip_blocked", log.ip);
-      
-      // Reset counter after block
-      failedAttempts[log.ip].count = 0;
-    }
-  }
-
-  // 2. Unusual Location Detection (Simulated)
-  if (log.location === "Moscow, RU" && log.username === "admin") {
-    const alert = {
-      id: Math.random().toString(36).substr(2, 9),
-      type: "unusual_location",
-      severity: "medium",
-      message: `Admin login attempt from unusual location: ${log.location}`,
-      timestamp: new Date().toISOString(),
-      ip: log.ip,
-    };
-    alerts.unshift(alert);
-    io.emit("new_alert", alert);
-  }
-}
-
-// API Routes
-apiRouter.post("/login", (req, res) => {
-  const { username, password } = req.body;
-  const user = users.find(u => u.username === username);
-  
-  if (user && bcrypt.compareSync(password, user.password)) {
-    const token = jwt.sign({ 
-      id: user.id, 
-      username: user.username, 
-      role: user.role,
-      mustChangePassword: user.mustChangePassword 
-    }, JWT_SECRET, { expiresIn: "1h" });
-    
-    return res.json({ 
-      token, 
-      role: user.role, 
-      username: user.username,
-      mustChangePassword: user.mustChangePassword 
-    });
-  }
-  res.status(401).json({ error: "Invalid credentials" });
-});
-
-apiRouter.post("/change-password", authenticateJWT, (req: any, res) => {
-  const { newPassword } = req.body;
-  const userIndex = users.findIndex(u => u.id === req.user.id);
-  if (userIndex === -1) return res.status(404).json({ error: "User not found" });
-
-  users[userIndex].password = bcrypt.hashSync(newPassword, 10);
-  users[userIndex].mustChangePassword = false;
-
-  res.json({ success: true });
-});
-
-apiRouter.get("/users", authenticateJWT, authorizeRole("admin"), (req, res) => {
-  const usersWithoutPasswords = users.map(({ password, ...u }) => u);
-  res.json(usersWithoutPasswords);
-});
-
-apiRouter.post("/users", authenticateJWT, authorizeRole("admin"), (req: any, res) => {
-  const { username, password, role } = req.body;
-  if (users.find(u => u.username === username)) {
-    return res.status(400).json({ error: "Username already exists" });
-  }
-  const newUser = {
-    id: Math.random().toString(36).substr(2, 9),
-    username,
-    password: bcrypt.hashSync(password, 10),
-    role,
-    createdAt: new Date().toISOString(),
-    mustChangePassword: false
-  };
-  users.push(newUser);
-  logAudit(req.user.username, "CREATE_USER", username);
-  res.status(201).json({ id: newUser.id, username: newUser.username, role: newUser.role });
-});
-
-apiRouter.put("/users/:id", authenticateJWT, authorizeRole("admin"), (req: any, res) => {
-  const { id } = req.params;
-  const { username, password, role } = req.body;
-  const userIndex = users.findIndex(u => u.id === id);
-  if (userIndex === -1) return res.status(404).json({ error: "User not found" });
-
-  const oldUsername = users[userIndex].username;
-  if (username) users[userIndex].username = username;
-  if (role) users[userIndex].role = role;
-  if (password) users[userIndex].password = bcrypt.hashSync(password, 10);
-
-  logAudit(req.user.username, "UPDATE_USER", username || oldUsername);
-  const { password: _, ...updatedUser } = users[userIndex];
-  res.json(updatedUser);
-});
-
-apiRouter.delete("/users/:id", authenticateJWT, authorizeRole("admin"), (req: any, res) => {
-  const { id } = req.params;
-  const userIndex = users.findIndex(u => u.id === id);
-  if (userIndex === -1) return res.status(404).json({ error: "User not found" });
-  
-  const targetUsername = users[userIndex].username;
-  if (req.user.id === id) {
-    return res.status(400).json({ error: "You cannot delete your own account" });
-  }
-
-  users.splice(userIndex, 1);
-  logAudit(req.user.username, "DELETE_USER", targetUsername);
-  res.sendStatus(204);
-});
-
-apiRouter.post("/users/:id/reset-password", authenticateJWT, authorizeRole("admin"), (req: any, res) => {
-  const { id } = req.params;
-  const userIndex = users.findIndex(u => u.id === id);
-  if (userIndex === -1) return res.status(404).json({ error: "User not found" });
-
-  const tempPassword = Math.random().toString(36).substr(2, 8);
-  users[userIndex].password = bcrypt.hashSync(tempPassword, 10);
-  users[userIndex].mustChangePassword = true;
-
-  logAudit(req.user.username, "RESET_PASSWORD", users[userIndex].username);
-  res.json({ tempPassword });
-});
-
-apiRouter.get("/audit-logs", authenticateJWT, authorizeRole("admin"), (req, res) => {
-  res.json(auditLogs);
-});
-
-apiRouter.get("/logs", (req, res) => res.json(logs));
-apiRouter.get("/alerts", (req, res) => res.json(alerts));
-apiRouter.get("/stats", (req, res) => {
+// Debug route to check env
+app.get("/api/debug", (req, res) => {
   res.json({
-    total: logs.length,
-    failed: logs.filter(l => l.status === "failed").length,
-    highRisk: alerts.filter(a => a.severity === "high").length,
-    blocked: blockedIPs.size,
+    hasVTKey: !!process.env.VIRUSTOTAL_API_KEY,
+    nodeVersion: process.version,
+    env: process.env.NODE_ENV
   });
 });
 
-apiRouter.post("/block-ip", (req, res) => {
-  const { ip } = req.body;
-  blockedIPs.add(ip);
-  io.emit("ip_blocked", ip);
-  res.json({ success: true });
-});
+// Email Notification Endpoint
+app.post("/api/notify", async (req, res) => {
+  const { to, subject, body } = req.body;
 
-apiRouter.post("/unblock-ip", (req, res) => {
-  const { ip } = req.body;
-  blockedIPs.delete(ip);
-  io.emit("ip_unblocked", ip);
-  res.json({ success: true });
-});
+  const service = process.env.EMAIL_SERVICE;
+  const user = process.env.EMAIL_USER;
+  const pass = process.env.EMAIL_PASS;
 
-apiRouter.get("/health", (req, res) => res.json({ status: "ok" }));
-
-app.use("/api", apiRouter);
-
-// Real-time loop
-setInterval(() => {
-  const log = generateLog();
-  if (log) {
-    io.emit("new_log", log);
+  if (!service || !user || !pass) {
+    console.warn("Email configuration missing. Notification skipped.");
+    return res.status(503).json({ error: "Email configuration missing" });
   }
-}, 3000);
+
+  try {
+    const transporter = nodemailer.createTransport({
+      service,
+      auth: { user, pass },
+    });
+
+    await transporter.sendMail({
+      from: `"Sentinel Security" <${user}>`,
+      to,
+      subject,
+      text: body,
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Failed to send email:", error);
+    res.status(500).json({ error: "Failed to send email" });
+  }
+});
+
+// VirusTotal Proxy Endpoints
+app.post("/api/scan/url", async (req, res) => {
+  const { url } = req.body;
+  const apiKey = process.env.VIRUSTOTAL_API_KEY;
+
+  if (!apiKey) return res.status(503).json({ error: "VirusTotal configuration missing" });
+  if (!url) return res.status(400).json({ error: "URL is required" });
+
+  try {
+    const params = new URLSearchParams();
+    params.append("url", url);
+    
+    const scanResponse = await axios.post("https://www.virustotal.com/api/v3/urls", params, {
+      headers: {
+        "x-apikey": apiKey,
+        "content-type": "application/x-www-form-urlencoded"
+      }
+    });
+
+    res.json({ 
+      success: true, 
+      analysisId: scanResponse.data.data.id,
+      originalUrl: url
+    });
+  } catch (error: any) {
+    console.error("VT URL Scan Error:", error.response?.data || error.message);
+    res.status(error.response?.status || 500).json({ error: "Failed to scan URL" });
+  }
+});
+
+app.get("/api/scan/report/:id", async (req, res) => {
+  const { id } = req.params;
+  const apiKey = process.env.VIRUSTOTAL_API_KEY;
+
+  if (!apiKey) return res.status(503).json({ error: "VirusTotal configuration missing" });
+
+  try {
+    const reportResponse = await axios.get(`https://www.virustotal.com/api/v3/analyses/${id}`, {
+      headers: { "x-apikey": apiKey }
+    });
+    res.json(reportResponse.data);
+  } catch (error: any) {
+    console.error("VT Report Error:", error.response?.data || error.message);
+    res.status(error.response?.status || 500).json({ error: "Failed to fetch report" });
+  }
+});
+
+app.post("/api/scan/file", upload.single("file"), async (req, res) => {
+  const apiKey = process.env.VIRUSTOTAL_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: "VirusTotal configuration missing" });
+  if (!req.file) return res.status(400).json({ error: "File is required" });
+
+  try {
+    const formData = new FormData();
+    const blob = new Blob([req.file.buffer], { type: req.file.mimetype });
+    formData.append("file", blob, req.file.originalname);
+
+    const scanResponse = await axios.post("https://www.virustotal.com/api/v3/files", formData, {
+      headers: {
+        "x-apikey": apiKey
+      }
+    });
+
+    res.json({
+      success: true,
+      analysisId: scanResponse.data.data.id,
+      fileName: req.file.originalname
+    });
+  } catch (error: any) {
+    console.error("VT File Scan Error:", error.response?.data || error.message);
+    res.status(error.response?.status || 500).json({ 
+      error: "Failed to scan file",
+      details: error.response?.data?.error?.message || error.message 
+    });
+  }
+});
+
+// Final error handler to catch unhandled errors and return JSON
+app.use((err: any, req: any, res: any, next: any) => {
+  console.error("[Unhandled Error]", err);
+  res.status(err.status || 500).json({
+    error: "Internal Server Error",
+    details: err.message
+  });
+});
 
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
